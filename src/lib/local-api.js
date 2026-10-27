@@ -19,6 +19,10 @@ const SYNC_TIMEOUT_MS = 120_000;
 // request still falls back normally; subsequent fan-out requests reuse that
 // decision for a short cooldown and return local data immediately.
 const ACCOUNT_VIEW_FAILURE_BACKOFF_MS = 2 * 60_000;
+// A caller stops waiting for the cloud after the response timeout, but the
+// read keeps going in the background for this many times as long so a slow
+// edge can still fill the payload cache and end the backoff early.
+const ACCOUNT_VIEW_BACKGROUND_TIMEOUT_FACTOR = 5;
 const TRACKER_BIN = path.resolve(__dirname, "../../bin/tracker.js");
 const MAX_DEVICE_NAME_LENGTH = 128;
 
@@ -1477,51 +1481,82 @@ function createLocalApiHandler({ queuePath }) {
     if (accountViewInFlight.has(requestKey)) {
       return "transient-inflight";
     }
-    accountViewInFlight.add(requestKey);
     const envTimeout = process.env.TOKENTRACKER_HTTP_TIMEOUT_MS
       ? parseInt(process.env.TOKENTRACKER_HTTP_TIMEOUT_MS, 10)
       : 0;
-    const timeoutMs = envTimeout > 0 ? envTimeout : 4000;
-    try {
-      const out = await fetchAccountUsage({
-        usageSlug,
-        searchParams: url.searchParams,
-        baseUrl: runtime.baseUrl || DEFAULT_BASE_URL,
-        anonKey: runtime.anonKey,
-        refreshToken,
-        timeoutMs,
-      });
-      // `null` here means the slug has no cloud equivalent, or the session
-      // vanished mid-request — a routing/session fact, not an outage.
-      if (!out) return ACCOUNT_FALLBACK_SIGNED_OUT;
-      if (out.data == null) {
+    // `responseTimeoutMs` bounds how long THIS caller waits before it gets the
+    // local fallback. The cloud read itself may run longer (up to
+    // `ACCOUNT_VIEW_BACKGROUND_TIMEOUT_FACTOR` times that) in the background:
+    // a slow-but-healthy edge (full-history aggregates from far regions often
+    // take 2-6 s) then still lands in the payload cache and clears the backoff,
+    // so the next poll is served instead of re-timing-out against an edge that
+    // went cold during the previous backoff window.
+    const responseTimeoutMs = envTimeout > 0 ? envTimeout : 4000;
+    const requestTimeoutMs = responseTimeoutMs * ACCOUNT_VIEW_BACKGROUND_TIMEOUT_FACTOR;
+    const probe = (async () => {
+      try {
+        const out = await fetchAccountUsage({
+          usageSlug,
+          searchParams: url.searchParams,
+          baseUrl: runtime.baseUrl || DEFAULT_BASE_URL,
+          anonKey: runtime.anonKey,
+          refreshToken,
+          timeoutMs: requestTimeoutMs,
+        });
+        // `null` here means the slug has no cloud equivalent, or the session
+        // vanished mid-request — a routing/session fact, not an outage.
+        if (!out) return { reason: ACCOUNT_FALLBACK_SIGNED_OUT };
+        // Persist a rotation even when this caller has stopped waiting: the
+        // backend has already consumed the previous refresh token.
+        if (out.rotatedRefreshToken) setRelayRefreshToken(out.rotatedRefreshToken);
+        if (out.rotatedCsrfToken) setRelayCsrfToken(out.rotatedCsrfToken);
+        if (out.data == null) {
+          rememberAccountViewFailure(failureKey);
+          return { reason: "transient-upstream" };
+        }
+        accountViewFailures.delete(failureKey);
+        return { reason: "served", data: out.data };
+      } catch (e) {
+        // Signed in + cloud sync on, but the cloud read failed (offline, token
+        // rejected, edge error, or timeout). Serve local data rather than
+        // erroring, but say so: this is a *temporary* downgrade and the client
+        // must not treat it as the user's real data scope.
+        const reason = classifyAccountFallback(e);
+        if (resolveRuntimeConfig().debug) {
+          console.warn(`[LocalAPI] account view fallback (${reason}) for ${usageSlug}:`, e?.message || e);
+        }
         rememberAccountViewFailure(failureKey);
-        return "transient-upstream";
+        return { reason };
+      } finally {
+        accountViewInFlight.delete(requestKey);
       }
-      if (out.rotatedRefreshToken) setRelayRefreshToken(out.rotatedRefreshToken);
-      if (out.rotatedCsrfToken) setRelayCsrfToken(out.rotatedCsrfToken);
-      accountViewFailures.delete(failureKey);
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-        "X-TokenTracker-Account-View": "1",
-      });
-      res.end(JSON.stringify(out.data));
-      return "served";
-    } catch (e) {
-      // Signed in + cloud sync on, but the cloud read failed (offline, token
-      // rejected, edge error, or timeout). Serve local data rather than
-      // erroring, but say so: this is a *temporary* downgrade and the client
-      // must not treat it as the user's real data scope.
-      const reason = classifyAccountFallback(e);
-      if (resolveRuntimeConfig().debug) {
-        console.warn(`[LocalAPI] account view fallback (${reason}) for ${usageSlug}:`, e?.message || e);
-      }
+    })();
+    accountViewInFlight.add(requestKey);
+
+    let responseTimer;
+    const responseDeadline = new Promise((resolve) => {
+      responseTimer = setTimeout(() => resolve(null), responseTimeoutMs);
+      if (typeof responseTimer.unref === "function") responseTimer.unref();
+    });
+    const result = await Promise.race([probe, responseDeadline]);
+    clearTimeout(responseTimer);
+    if (!result) {
+      // Still pending: back the fan-out off as before. The background probe
+      // clears this on success, or re-arms it on failure.
       rememberAccountViewFailure(failureKey);
-      return reason;
-    } finally {
-      accountViewInFlight.delete(requestKey);
+      if (resolveRuntimeConfig().debug) {
+        console.warn(`[LocalAPI] account view still pending after ${responseTimeoutMs}ms for ${usageSlug}; continuing in background`);
+      }
+      return "transient-timeout";
     }
+    if (result.reason !== "served") return result.reason;
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "X-TokenTracker-Account-View": "1",
+    });
+    res.end(JSON.stringify(result.data));
+    return "served";
   }
 
   function normalizeCookieHeader(value) {
